@@ -5,7 +5,8 @@ from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage
 import xml.etree.ElementTree as ET
 from datetime import datetime,timedelta
-
+from log import logger as log
+from llm_client import LLMClientFactory
 
 config = configparser.ConfigParser()
 config.read('config.ini')  # 读取配置文件
@@ -14,16 +15,32 @@ config.read('config.ini')  # 读取配置文件
 model = config['llm']['model']
 base_url = config['llm']['base_url']
 api_key = config['llm']['api_key']
+llm_service_type = config['general']['LLM_SERVICE_TYPE']
 
+# 初始化
+# 初始化 ChatOpenAI 模型
+# llm=ChatOpenAI(model=model,openai_api_base=base_url,openai_api_key=api_key)
+# 初始化LLM客户端 (可从配置或环境变量读取服务类型)
+llm_client = LLMClientFactory.create_client(
+    service_type=llm_service_type,
+    api_key=api_key,
+    model=model,
+    base_url=base_url
+)
+# 关键词列表，用来维护期望获取的论文领域
+Fields_list = [{"field":"llm with security","keywords":['llm','security']}]
+
+
+# 获取 Arxiv 上的论文信息，TODO：根据关键词列表筛选
 def get_arxiv():
     # 定义 API URL
-    max_results = 1  # 每页最多返回的结果数
+    max_results = 1000  # 每页最多返回的结果数
     arxiv_base_url = 'http://export.arxiv.org/api/query'
     today = datetime.today().strftime('%Y%m%d')  # 获取今天的日期，格式为 YYYYMMDD
     last_week = (datetime.today() - timedelta(days=7)).strftime('%Y%m%d')  # 获取一周前的日期，格式为 YYYYMMDD
     search_query = f'submittedDate:[{last_week} TO {today}] AND ti:llm AND all:security'
     arxiv_url = f'{arxiv_base_url}?search_query={search_query}&max_results={max_results}'
-    print(arxiv_url)
+    log.debug(arxiv_url)
     try:
         # 发送 GET 请求
         response = requests.get(arxiv_url)
@@ -33,9 +50,10 @@ def get_arxiv():
         # print(response.text)
         return response.text
     except requests.exceptions.RequestException as e:
-        print(f'请求出错: {e}')
+        log.error(f'请求出错: {e}')
         return ''
 
+# 获取论文的引用量
 def get_citation_count(arxiv_id):
         # 使用 Semantic Scholar API 获取引用量
     semantic_scholar_url = f'https://api.semanticscholar.org/graph/v1/paper/arXiv:{arxiv_id}?fields=citationCount'
@@ -47,40 +65,130 @@ def get_citation_count(arxiv_id):
         citation_count = None
     return citation_count
 
-# 初始化 ChatOpenAI 模型
-llm=ChatOpenAI(model=model,openai_api_base=base_url,openai_api_key=api_key)
-
-# 获取 Arxiv 上的论文信息
-arxiv_data = get_arxiv()
-
-# 解析 Arxiv 数据
-if arxiv_data:
-    # 解析 XML 数据
-    root = ET.fromstring(arxiv_data)
-    ns = {'atom': 'http://www.w3.org/2005/Atom'}
-    entries = root.findall('.//atom:entry', ns)
+# 使用llm阅读论文正文，看需求是否需要换LLM
+# 优先html，提取文本比较方便
+# 如果html提取失败，再用pdf
+def paper_read(reader_llm,html_url,pdf_url=None):
+    import requests
+    from bs4 import BeautifulSoup
+    from urllib.parse import urljoin
     
-    for entry in entries:
-        # 提取标题和简述
-        title = entry.find('atom:title', ns).text.strip() # 标题
-        summary = entry.find('atom:summary', ns).text.strip() # 简述
-        url = entry.find('atom:id', ns).text.strip() # 链接
-        arxiv_id = entry.find('atom:id', ns).text.strip().split('/')[-1].split('v')[0] # arxiv_id
-
-        # 使用 LLM 对简述进行翻译总结
-        prompt = f'这有一篇论文的标题叫{title}，请根据它的summary给出一个中文简述：\n{summary}'
-        translated_summary = llm.invoke([HumanMessage(content=prompt)])
-        citation_count = get_citation_count(arxiv_id) 
+    if html_url:
+        # 从html中提取文本
+        try:
+            # 添加请求头模拟浏览器访问
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            response = requests.get(html_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            # 解析HTML
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 提取论文正文（根据arXiv HTML结构调整选择器）
+            content_div = soup.find('div', class_='ltx_page_content')
+            if not content_div:
+                content_div = soup.find('body')  # 备选方案
+            
+            # 提取文本内容
+            text_content = content_div.get_text(separator='\n', strip=True) if content_div else ''
+            
+            # 使用LLM分析内容（仅文本输入）
+            analysis_prompt = f"分析以下论文内容: \n{text_content[:8000]}..."
+            analysis_result = reader_llm.invoke(analysis_prompt)  # 不再传递images参数
+            
+            return {
+                'text': text_content,
+                'analysis': analysis_result
+            }
+            
+        except Exception as e:
+            log.error(f'HTML内容提取失败: {str(e)}')
+            if pdf_url:
+                return paper_read(reader_llm, None, pdf_url)
+            return {'error': str(e)}
         
-        # 使用 LLM 根据简述生成标签
-        tags_prompt = f'你是一个计算机科学学术论文分析专家，请根据以下论文的标题和简述生成中文标签，用逗号分隔，如果这篇论文你判断是一个网络安全相关的论文，标签列表中必须包含至少两个标签之一：\'LLM for Security\'--指使用LLM应用于解决网络安全的某些难题；\'Security for LLM\'--指对LLM软硬件及其基础设施的网络安全研究。\n以下是论文信息\n<标题>：{title},<简述>：{summary}'
-        tags_result = llm.invoke([HumanMessage(content=tags_prompt)])
-        tags = tags_result.content.replace('\n','').split(',')  # 假设标签以逗号分隔
+    elif pdf_url:
+        # 从pdf中提取文本
+        pass
+    else:
+        return {'error': '未提供论文链接'}
 
-        # 打印结果 
-        print(f'标题: {title}')
-        print(f'链接: {url}')
-        print(f'原始简述: {summary}')
-        print(f'翻译总结: {translated_summary.content}\n')
-        print(f'标签: {tags}\n')
-        print(f'引用量: {citation_count}\n')
+
+
+def run():
+    # 获取 Arxiv 上的论文信息
+    arxiv_data = get_arxiv()
+
+    # 创建输出目录
+    output_dir = 'output'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # 初始化Markdown内容
+    markdown_content = '# arXiv论文信息汇总\n\n'
+    
+    # 解析 Arxiv 数据
+    if arxiv_data:
+        # 解析 XML 数据
+        root = ET.fromstring(arxiv_data)
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
+        entries = root.findall('.//atom:entry', ns)
+        log.info(f'总论文数: {len(entries)}')
+        # log.info(entries)
+        for entry in entries:
+            # 提取标题和简述
+            title = entry.find('atom:title', ns).text.strip().replace('\n',' ') # 标题
+            summary = entry.find('atom:summary', ns).text.strip() # 简述
+            url = entry.find('atom:id', ns).text.strip() # 链接
+            arxiv_id = entry.find('atom:id', ns).text.strip().split('/')[-1].split('v')[0] # arxiv_id
+
+            # 使用 LLM 对简述进行翻译总结
+            prompt = f'这有一篇论文的标题叫{title}，请根据它的summary给出一个中文简述：\n{summary}'
+            translated_summary = llm_client.invoke(prompt)
+            citation_count = get_citation_count(arxiv_id) 
+            
+            # 使用 LLM 根据简述生成标签
+            tags_prompt = f'你是一个计算机科学学术论文分析专家，请根据以下论文的标题和简述生成中文标签，用逗号分隔，如果这篇论文你判断是一个网络安全相关的论文，标签列表中必须包含至少两个标签之一：\'LLM for Security\'--指使用LLM应用于解决网络安全的某些难题；\'Security for LLM\'--指对LLM软硬件及其基础设施的网络安全研究。\n以下是论文信息\n<标题>：{title},<简述>：{summary}'
+            tags_result = llm_client.invoke(tags_prompt)
+            tags = tags_result.replace('\n','').split(',')  # 假设标签以逗号分隔
+
+            # 打印结果 
+            log.info(f'arXiv ID: {arxiv_id}')
+            log.info(f'标题: {title}')
+            log.info(f'链接: {url}')
+            log.info(f'原始简述: {summary}')
+            log.info(f'翻译总结: {translated_summary}\n')
+            log.info(f'标签: {tags}\n')
+            log.info(f'引用量: {citation_count}')
+
+            # 提取论文ID并构建PDF和HTML链接
+            paper_id = url.split('/')[-1]
+            pdf_url = f'https://arxiv.org/pdf/{paper_id}.pdf'
+            html_url = f'https://arxiv.org/html/{paper_id}'
+            log.info(f'PDF链接: {pdf_url}')
+            log.info(f'HTML链接: {html_url}\n')
+
+            # 生成markdown
+            markdown_content += f'## {title}\n\n'
+            markdown_content += f'### 链接\n[{url}]({url})\n'
+            markdown_content += f'### 原始简述\n{summary}\n'
+            markdown_content += f'### 翻译总结\n{translated_summary}\n'
+            markdown_content += f'### 标签\n{tags}\n' 
+            markdown_content += f'### 引用量\n{citation_count}\n'
+            markdown_content += f'### PDF链接\n[{pdf_url}]({pdf_url})\n'
+            markdown_content += f'### HTML链接\n[{html_url}]({html_url})\n\n---\n\n'
+            
+        # 生成带时间戳的文件名
+        current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+        md_filename = os.path.join(output_dir, f'arxiv_{current_time}.md')
+        
+        # 保存Markdown文件
+        with open(md_filename, 'w', encoding='utf-8') as f:
+            f.write(markdown_content)
+        
+        log.info(f'论文信息已保存到: {md_filename}')
+
+if __name__ == '__main__':
+    run()
