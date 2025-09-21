@@ -2,11 +2,15 @@ import os
 import requests
 import configparser
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage
+import asyncio
+
 import xml.etree.ElementTree as ET
 from datetime import datetime,timedelta
 from log import logger as log
-from llm_client import LLMClientFactory
+from agent_reader import read
+
+os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
+os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
 
 config = configparser.ConfigParser()
 config.read('config.ini')  # 读取配置文件
@@ -19,26 +23,18 @@ llm_service_type = config['general']['LLM_SERVICE_TYPE']
 
 # 初始化
 # 初始化 ChatOpenAI 模型
-# llm=ChatOpenAI(model=model,openai_api_base=base_url,openai_api_key=api_key)
-# 初始化LLM客户端 (可从配置或环境变量读取服务类型)
-llm_client = LLMClientFactory.create_client(
-    service_type=llm_service_type,
-    api_key=api_key,
-    model=model,
-    base_url=base_url
-)
-# 关键词列表，用来维护期望获取的论文领域
-Fields_list = [{"field":"llm with security","keywords":['llm','security']}]
-
+llm=ChatOpenAI(model=model,openai_api_base=base_url,openai_api_key=api_key)
 
 # 获取 Arxiv 上的论文信息，TODO：根据关键词列表筛选
-def get_arxiv():
+def get_arxiv(topics,days=7,):
     # 定义 API URL
+    topics = list(set(topics))
     max_results = 1000  # 每页最多返回的结果数
     arxiv_base_url = 'http://export.arxiv.org/api/query'
     today = datetime.today().strftime('%Y%m%d')  # 获取今天的日期，格式为 YYYYMMDD
-    last_week = (datetime.today() - timedelta(days=7)).strftime('%Y%m%d')  # 获取一周前的日期，格式为 YYYYMMDD
-    search_query = f'submittedDate:[{last_week} TO {today}] AND ti:llm AND all:security'
+    last_week = (datetime.today() - timedelta(days)).strftime('%Y%m%d')  # 获取一周前的日期，格式为 YYYYMMDD
+    topic_str = ' AND '.join([f'all:{topic}' for topic in topics])
+    search_query = f'submittedDate:[{last_week} TO {today}] AND {topic_str}'
     arxiv_url = f'{arxiv_base_url}?search_query={search_query}&max_results={max_results}'
     log.debug(arxiv_url)
     try:
@@ -64,6 +60,39 @@ def get_citation_count(arxiv_id):
     except requests.exceptions.RequestException:  
         citation_count = None
     return citation_count
+
+# 下载PDF文件
+def download_pdf(pdf_url, pdf_filename):
+    # 检查保存目录是否存在，如果不存在则创建
+    os.makedirs(os.path.dirname(pdf_filename), exist_ok=True)
+    
+    try:
+        # 添加请求头模拟浏览器访问
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # 发送GET请求获取PDF文件，使用stream=True进行流式下载
+        response = requests.get(pdf_url, headers=headers, stream=True, timeout=30)
+        response.raise_for_status()  # 检查请求是否成功
+        
+        # 以二进制模式写入文件
+        with open(pdf_filename, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:  # 过滤掉保持连接的空块
+                    f.write(chunk)
+        
+        log.info(f'PDF已成功下载: {pdf_filename}')
+        return True
+        
+    except requests.exceptions.RequestException as e:
+        log.error(f'下载PDF失败 {pdf_url}: {str(e)}')
+    except IOError as e:
+        log.error(f'保存PDF文件失败 {pdf_filename}: {str(e)}')
+    except Exception as e:
+        log.error(f'下载PDF时发生未知错误: {str(e)}')
+    
+    return False
 
 # 使用llm阅读论文正文，看需求是否需要换LLM
 # 优先html，提取文本比较方便
@@ -119,7 +148,8 @@ def paper_read(reader_llm,html_url,pdf_url=None):
 
 def run():
     # 获取 Arxiv 上的论文信息
-    arxiv_data = get_arxiv()
+    topics = ['agent','red team']
+    arxiv_data = get_arxiv(topics,days=360)
 
     # 创建输出目录
     output_dir = 'output'
@@ -137,6 +167,13 @@ def run():
         entries = root.findall('.//atom:entry', ns)
         log.info(f'总论文数: {len(entries)}')
         # log.info(entries)
+
+        # 生成带时间戳的文件名
+        current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+        topic_filename = '_'.join(topics)
+        md_filename = os.path.join(output_dir, f'arxiv_{topic_filename}_{current_time}.md')
+        
+
         for entry in entries:
             # 提取标题和简述
             title = entry.find('atom:title', ns).text.strip().replace('\n',' ') # 标题
@@ -145,13 +182,15 @@ def run():
             arxiv_id = entry.find('atom:id', ns).text.strip().split('/')[-1].split('v')[0] # arxiv_id
 
             # 使用 LLM 对简述进行翻译总结
-            prompt = f'这有一篇论文的标题叫{title}，请根据它的summary给出一个中文简述：\n{summary}'
-            translated_summary = llm_client.invoke(prompt)
+            with open('prompts/summarize_a_paper.txt', 'r') as f:
+                prompt = f.read().format(title=title,summary=summary)
+            translated_summary = llm.invoke(prompt).content
             citation_count = get_citation_count(arxiv_id) 
             
             # 使用 LLM 根据简述生成标签
-            tags_prompt = f'你是一个计算机科学学术论文分析专家，请根据以下论文的标题和简述生成中文标签，用逗号分隔，如果这篇论文你判断是一个网络安全相关的论文，标签列表中必须包含至少两个标签之一：\'LLM for Security\'--指使用LLM应用于解决网络安全的某些难题；\'Security for LLM\'--指对LLM软硬件及其基础设施的网络安全研究。\n以下是论文信息\n<标题>：{title},<简述>：{summary}'
-            tags_result = llm_client.invoke(tags_prompt)
+            with open('prompts/tag_a_paper.txt', 'r') as f:
+                tags_prompt = f.read().format(title=title,summary=translated_summary)
+            tags_result = llm.invoke(tags_prompt).content
             tags = tags_result.replace('\n','').split(',')  # 假设标签以逗号分隔
 
             # 打印结果 
@@ -170,24 +209,30 @@ def run():
             log.info(f'PDF链接: {pdf_url}')
             log.info(f'HTML链接: {html_url}\n')
 
-            # 生成markdown
-            markdown_content += f'## {title}\n\n'
-            markdown_content += f'### 链接\n[{url}]({url})\n'
-            markdown_content += f'### 原始简述\n{summary}\n'
-            markdown_content += f'### 翻译总结\n{translated_summary}\n'
-            markdown_content += f'### 标签\n{tags}\n' 
-            markdown_content += f'### 引用量\n{citation_count}\n'
-            markdown_content += f'### PDF链接\n[{pdf_url}]({pdf_url})\n'
-            markdown_content += f'### HTML链接\n[{html_url}]({html_url})\n\n---\n\n'
-            
-        # 生成带时间戳的文件名
-        current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
-        md_filename = os.path.join(output_dir, f'arxiv_{current_time}.md')
-        
-        # 保存Markdown文件
-        with open(md_filename, 'w', encoding='utf-8') as f:
-            f.write(markdown_content)
-        
+            # 没有文件则生成markdown 有则追加
+            with open(md_filename, 'w+', encoding='utf-8') as f:
+                # f.write(markdown_content)
+                markdown_content = f'# {title}\n\n'
+                markdown_content += f'## 链接\n[{url}]({url})\n'
+                markdown_content += f'## 原始简述\n{summary}\n'
+                markdown_content += f'## 翻译总结\n{translated_summary}\n'
+                markdown_content += f'## 标签\n{tags}\n' 
+                markdown_content += f'## 引用量\n{citation_count}\n'
+                markdown_content += f'## PDF链接\n[{pdf_url}]({pdf_url})\n'
+                markdown_content += f'## HTML链接\n[{html_url}]({html_url})\n\n---\n\n'
+                f.write(markdown_content)
+
+            # 下载pdf
+            pdf_filename = os.path.join(os.getcwd(),'pdf_downloads', f'{paper_id}.pdf')
+            download_pdf(pdf_url, pdf_filename)
+            # 异步分析论文
+            try:
+                asyncio.run(read(pdf_filename))
+                log.info(f'分析论文完成: {paper_id}')
+            except Exception as e:
+                log.error(f'分析论文失败: {paper_id}')
+                continue
+
         log.info(f'论文信息已保存到: {md_filename}')
 
 if __name__ == '__main__':

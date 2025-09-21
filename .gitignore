@@ -1,3 +1,9 @@
 config.ini
 output/*
 logs/*
+summary_result/*
+pdf_downloads/*
+markitdown/*
+*/__pycache__/*
+__pycache__/*
+test/*

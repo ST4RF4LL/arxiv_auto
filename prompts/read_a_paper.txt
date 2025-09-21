@@ -1,0 +1,2 @@
+请调用markitdown-mcp工具将`{paper_filepath}`转换成markdown格式用来进行正文内容读取
+接着对这篇论文进行分析，并输出分析结果
