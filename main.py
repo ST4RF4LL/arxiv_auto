@@ -210,7 +210,7 @@ def run():
             log.info(f'HTML链接: {html_url}\n')
 
             # 没有文件则生成markdown 有则追加
-            with open(md_filename, 'w+', encoding='utf-8') as f:
+            with open(md_filename, 'a', encoding='utf-8') as f:
                 # f.write(markdown_content)
                 markdown_content = f'# {title}\n\n'
                 markdown_content += f'## 链接\n[{url}]({url})\n'
