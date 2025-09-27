@@ -8,6 +8,8 @@ import pprint
 import json
 from log import logger as log
 import os 
+import sys
+
 # mcp
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -26,8 +28,11 @@ llm_service_type = config['general']['LLM_SERVICE_TYPE']
 async def read(paper_filepath: str):
     log.info(f'读取论文: {paper_filepath}')
 
-    papername = paper_filepath.split('/')[-1]
-    summary_filepath = f"./summary_result/{papername}_summary.md"
+    if sys.platform == 'win32':
+        papername = paper_filepath.split('\\')[-1]
+    else:
+        papername = paper_filepath.split('/')[-1]
+    summary_filepath = os.path.join('summary_result', f"{papername}_summary.md")
     if os.path.exists(summary_filepath):
         log.info(f'论文已分析过: {papername}')
         return

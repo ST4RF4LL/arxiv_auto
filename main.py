@@ -3,6 +3,7 @@ import requests
 import configparser
 from langchain_openai import ChatOpenAI
 import asyncio
+import json
 
 import xml.etree.ElementTree as ET
 from datetime import datetime,timedelta
@@ -146,10 +147,10 @@ def paper_read(reader_llm,html_url,pdf_url=None):
 
 
 
-def run():
+def run(topics = ['agent','red team'],days=360,deep_read = True):
     # 获取 Arxiv 上的论文信息
-    topics = ['agent','red team']
-    arxiv_data = get_arxiv(topics,days=360)
+    t
+    arxiv_data = get_arxiv(topics,days=days)
 
     # 创建输出目录
     output_dir = 'output'
@@ -177,7 +178,7 @@ def run():
         for entry in entries:
             # 提取标题和简述
             title = entry.find('atom:title', ns).text.strip().replace('\n',' ') # 标题
-            summary = entry.find('atom:summary', ns).text.strip() # 简述
+            summary = entry.find('atom:summary', ns).text.strip().replace('\n',' ') # 简述
             url = entry.find('atom:id', ns).text.strip() # 链接
             arxiv_id = entry.find('atom:id', ns).text.strip().split('/')[-1].split('v')[0] # arxiv_id
 
@@ -209,7 +210,20 @@ def run():
             log.info(f'PDF链接: {pdf_url}')
             log.info(f'HTML链接: {html_url}\n')
 
-            # 没有文件则生成markdown 有则追加
+            deep_read_success = False
+            if deep_read:
+                # 下载pdf
+                pdf_filename = os.path.join(os.getcwd(),'pdf_downloads', f'{paper_id}.pdf')
+                download_pdf(pdf_url, pdf_filename)
+                # 异步分析论文
+                try:
+                    asyncio.run(read(pdf_filename))
+                    log.info(f'分析论文完成: {paper_id}')
+                    deep_read_success = True
+                except Exception as e:
+                    log.error(f'分析论文失败: {paper_id}')
+                    continue
+                # 没有文件则生成markdown 有则追加
             with open(md_filename, 'a', encoding='utf-8') as f:
                 # f.write(markdown_content)
                 markdown_content = f'# {title}\n\n'
@@ -219,21 +233,119 @@ def run():
                 markdown_content += f'## 标签\n{tags}\n' 
                 markdown_content += f'## 引用量\n{citation_count}\n'
                 markdown_content += f'## PDF链接\n[{pdf_url}]({pdf_url})\n'
-                markdown_content += f'## HTML链接\n[{html_url}]({html_url})\n\n---\n\n'
+                markdown_content += f'## HTML链接\n[{html_url}]({html_url})\n'
+                if deep_read_success:
+                    markdown_content += f'## 分析总结\n请查看 `summary_result/{paper_id}_summary.md` 文件\n'
+                markdown_content += '\n\n---- \n\n'
                 f.write(markdown_content)
-
-            # 下载pdf
-            pdf_filename = os.path.join(os.getcwd(),'pdf_downloads', f'{paper_id}.pdf')
-            download_pdf(pdf_url, pdf_filename)
-            # 异步分析论文
-            try:
-                asyncio.run(read(pdf_filename))
-                log.info(f'分析论文完成: {paper_id}')
-            except Exception as e:
-                log.error(f'分析论文失败: {paper_id}')
-                continue
 
         log.info(f'论文信息已保存到: {md_filename}')
 
+def run2(pasa_file, deep_read=True):
+    """
+    基于指定的JSON文件运行论文分析流程
+    
+    参数:
+    - pasa_file: 包含论文信息的JSON文件路径，例如"paper-agent-download.json"
+    - deep_read: 是否深度阅读论文内容
+    """
+    
+    
+    # 创建输出目录
+    output_dir = 'output'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # 初始化Markdown内容
+    markdown_content = '# arXiv论文信息汇总\n\n'    
+    
+    try:
+        # 读取JSON文件
+        with open(pasa_file, 'r', encoding='utf-8') as f:
+            papers_data = json.load(f)
+        
+        log.info(f'从文件{pasa_file}中读取到{len(papers_data)}篇论文')
+        
+        # 生成带时间戳的文件名
+        current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+        md_filename = os.path.join(output_dir, f'papers_from_json_{current_time}.md')
+        
+        # 处理每篇论文
+        for paper in papers_data:
+            # 提取论文基本信息
+            title = paper.get('title', '未知标题')
+            summary = paper.get('summary', '无摘要信息')
+            url = paper.get('url', '')
+            arxiv_id = url.split('/')[-1].split('v')[0] if url else 'unknown'
+            
+            # 使用LLM对简述进行翻译总结
+            with open('prompts/summarize_a_paper.txt', 'r') as f:
+                prompt = f.read().format(title=title, summary=summary)
+            translated_summary = llm.invoke(prompt).content
+            citation_count = get_citation_count(arxiv_id) if arxiv_id != 'unknown' else None
+            
+            # 使用LLM根据简述生成标签
+            with open('prompts/tag_a_paper.txt', 'r') as f:
+                tags_prompt = f.read().format(title=title, summary=translated_summary)
+            tags_result = llm.invoke(tags_prompt).content
+            tags = tags_result.replace('\n', '').split(',')  # 假设标签以逗号分隔
+            
+            # 提取论文ID并构建PDF和HTML链接
+            paper_id = url.split('/')[-1] if url else arxiv_id
+            pdf_url = f'https://arxiv.org/pdf/{paper_id}.pdf' if paper_id != 'unknown' else ''
+            html_url = f'https://arxiv.org/html/{paper_id}' if paper_id != 'unknown' else ''
+            
+            # 打印结果
+            log.info(f'arXiv ID: {arxiv_id}')
+            log.info(f'标题: {title}')
+            log.info(f'链接: {url}')
+            log.info(f'原始简述: {summary}')
+            log.info(f'翻译总结: {translated_summary}\n')
+            log.info(f'标签: {tags}\n')
+            log.info(f'引用量: {citation_count}')
+            
+            deep_read_success = False
+            if deep_read and pdf_url:
+                # 下载pdf
+                pdf_filename = os.path.join(os.getcwd(), 'pdf_downloads', f'{paper_id}.pdf')
+                download_pdf(pdf_url, pdf_filename)
+                # 异步分析论文
+                try:
+                    asyncio.run(read(pdf_filename))
+                    log.info(f'分析论文完成: {paper_id}')
+                    deep_read_success = True
+                except Exception as e:
+                    log.error(f'分析论文失败: {paper_id}')
+                    # 即使分析失败也继续处理其他论文
+                    
+            # 将结果写入markdown文件
+            with open(md_filename, 'a', encoding='utf-8') as f:
+                markdown_content = f'# {title}\n\n'
+                markdown_content += f'## 链接\n[{url}]({url})\n' if url else '## 链接\n无\n'
+                markdown_content += f'## 原始简述\n{summary}\n'
+                markdown_content += f'## 翻译总结\n{translated_summary}\n'
+                markdown_content += f'## 标签\n{tags}\n'
+                markdown_content += f'## 引用量\n{citation_count}\n' if citation_count is not None else '## 引用量\n无法获取\n'
+                markdown_content += f'## PDF链接\n[{pdf_url}]({pdf_url})\n' if pdf_url else '## PDF链接\n无\n'
+                markdown_content += f'## HTML链接\n[{html_url}]({html_url})\n' if html_url else '## HTML链接\n无\n'
+                if deep_read_success:
+                    markdown_content += f'## 分析总结\n请查看 `summary_result/{paper_id}_summary.md` 文件\n'
+                markdown_content += '\n\n---- \n\n'
+                f.write(markdown_content)
+        
+        log.info(f'论文信息已保存到: {md_filename}')
+        return md_filename
+        
+    except json.JSONDecodeError as e:
+        log.error(f'JSON文件解析错误: {str(e)}')
+    except FileNotFoundError:
+        log.error(f'文件不存在: {pasa_file}')
+    except Exception as e:
+        log.error(f'处理论文数据时发生错误: {str(e)}')
+    
+    return None
+
 if __name__ == '__main__':
-    run()
+    # run()
+    # 如果需要运行run2函数，可以取消下面一行的注释并指定JSON文件路径
+    run2('test/paper-agent-download.json', deep_read=False)
